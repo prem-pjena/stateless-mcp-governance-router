@@ -1,0 +1,14 @@
+[project]
+name = "stateless-mcp-governance-router"
+version = "0.1.0"
+description = "Stateless MCP router exposing curated tools to agents over HTTP"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp",
+]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
