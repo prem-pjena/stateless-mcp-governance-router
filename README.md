@@ -1,611 +1,227 @@
 # Stateless MCP Governance Router
 
-A minimal, stateless Model Context Protocol (MCP) router built with FastMCP, exposing a curated tenant-scoped tool over HTTP.
+A Model Context Protocol (MCP) server that exposes a small, curated set of tools to agents over stateless
+HTTP — with authentication, per-tool authorization, containment and an audit trail wrapped around every
+call.
 
-The project is the foundation for a production-grade agentic infrastructure layer where agents can discover and execute controlled tools without relying on server-side session state.
-
-> **Current scope — Stair 23:** Stateless FastMCP HTTP server, one typed tenant-scoped tool, Pydantic request/response contracts, MCP Inspector verification, and HTTP GET → 405 protection.
+The point of the project is the governance layer, not the tools. Any MCP server can list tools; this one
+decides *who* may call *what*, refuses everything it does not know about, and records the decisions.
 
 ---
 
-## Why This Project Exists
+## Why this exists
 
-Agentic systems need more than an LLM.
+Giving an agent tool access is easy. Giving it tool access you can defend in production is not:
 
-An agent can reason about **what action should be taken**, but it needs tools to interact with external systems and data.
+- A tool server with no authentication is remote capability execution for anyone who can reach the port.
+- A server that keeps session state cannot be scaled horizontally, and a long-lived stream pins a caller to
+  one replica.
+- A tool that accepts free-form input (`dict`, `Any`) is an injection surface.
+- A tool that can read any path or call any host bypasses every earlier control.
+- Tools with real side effects (deleting data, sending mail) should not run on a model's decision alone.
+- Without an audit trail you cannot answer "who called what, and was it allowed?" after an incident.
 
-MCP provides a standardized protocol for exposing those capabilities.
-
-This project focuses on the protocol boundary between an agent and its tools:
-
-Agent
-  ↓
-MCP Router
-  ↓
-Curated Tool
-  ↓
-Enterprise Resource
-
-The router is intentionally stateless so that requests do not depend on previous in-memory server sessions.
-
-That makes the service easier to scale horizontally behind a load balancer because any healthy instance can handle an incoming request.
+Each of those concerns is a layer in this repo.
 
 ---
 
 ## Architecture
 
-Mermaid architecture:
-
+```mermaid
 flowchart LR
-    Agent[Agent / MCP Client]
-        -->|HTTP MCP request| Router[FastMCP Stateless Router]
+    Agent[MCP client / agent] -->|POST /mcp + Bearer token| Guard
 
-    Router
-        -->|tools/call| Tool[read_document]
+    subgraph Router["Stateless MCP Governance Router"]
+        Guard[Ingress guard<br/>Host + Origin allowlist<br/>405 on non-POST] --> Auth[Token enforcement<br/>EdDSA verify · aud binding<br/>5s skew · cached revocation]
+        Auth --> Scope[Scope guard<br/>per-tool scope from registry<br/>403 when missing]
+        Scope --> Tools[Declared tools only]
+        Tools --> Audit[(Append-only audit sink)]
+    end
 
-    Tool
-        -->|tenant_id + document_id| Store[(Mock Document Store)]
+    Tools -->|high-risk tool| Approvals[(Pending approvals<br/>SQLite)]
+    Approvals -->|HMAC webhook| Approve[POST /approvals/:id]
 
-    Tool
-        -->|Pydantic structured result| Router
+    AS[Authorization server] -.->|JWKS| Auth
+    AS -.->|revocation list| Auth
+```
 
-    Router
-        -->|MCP response| Agent
-
-### Request flow
-
-1. An MCP client sends a request to the HTTP MCP endpoint.
-2. FastMCP receives and processes the MCP request.
-3. The client can discover the available tool through `tools/list`.
-4. The client executes `read_document` through `tools/call`.
-5. The tool receives a typed `DocumentRequest`.
-6. The tool performs a tenant/document lookup.
-7. The tool returns a typed `DocumentResult`.
-8. FastMCP serializes the result into the MCP response.
+The router is stateless: no session state is kept between requests, so any replica can serve any call. The
+token *is* the session.
 
 ---
 
-## Stateless Design
+## Request flow
 
-The server runs FastMCP with `stateless_http=True`.
-
-Stateless HTTP means the server does not depend on a persistent in-memory MCP session between requests.
-
-Conceptually:
-
-Stateful server
-
-Client A
-   ↓
-Load Balancer
-   ↓
-Server 1
-   ↓
-Session stored in Server 1 memory
-
-Future request
-   ↓
-Must potentially return to Server 1
-
-With a stateless server:
-
-Client A
-   ↓
-Load Balancer
-   ├──→ Server 1
-   ├──→ Server 2
-   └──→ Server 3
-
-Each request contains the information required for the server to process it.
-
-This model is better suited to horizontal scaling because requests can be distributed across multiple healthy instances without depending on a particular server's in-memory session state.
+1. **Ingress guard** — checks `Host` (and `Origin` when present) against allowlists. Anything else is `400
+   HeaderMismatch`. Non-POST on `/mcp` is `405` with `Allow: POST`.
+2. **Token enforcement** — validates the bearer token locally: signature against the cached JWKS, `iss`, hard
+   `aud` binding, `exp`/`nbf` with a 5-second clock-skew tolerance, then a cached revocation lookup.
+   Failures return `401` with a `WWW-Authenticate` hint and a stable error code.
+3. **Scope guard** — reads the requested tool from the JSON-RPC body and checks the token's scope against the
+   registry. A valid token without the tool's scope gets `403 insufficient_scope` and tool code never runs.
+4. **Tool dispatch** — only tools declared in the registry can be listed or invoked. Tools needing human
+   sign-off return `approval_required` with a durable request id instead of executing.
+5. **Audit** — every decision above is appended to a JSONL audit sink.
 
 ---
 
-## HTTP Transport and GET → 405
+## Tools
 
-The MCP endpoint is:
+| Tool | Namespace | Scope | Tier | Approval |
+|------|-----------|-------|------|----------|
+| `documents.read_document` | documents | `mcp:documents:read` | core | no |
+| `reports.summarize_documents` | reports | `mcp:reports:read` | extended | no |
+| `reports.ask_model` | reports | `mcp:reports:read` | extended | no |
+| `files.read_text` | files | `mcp:files:read` | extended | no |
+| `documents.purge_document` | documents | `mcp:documents:write` | extended | **yes** |
 
-http://127.0.0.1:8000/mcp
-
-The server accepts MCP requests through HTTP `POST`.
-
-A direct `GET /mcp` request is rejected with:
-
-HTTP/1.1 405 Method Not Allowed
-
-Verified response body:
-
-Method Not Allowed
-
-The 405 response is enforced by the HTTP framework rather than by a custom application route.
-
-This prevents an unsupported GET request from being treated as an MCP operation.
+`tools/list` is scope-driven: a caller only sees the tools its token can actually use. Extended tools also
+require an explicit discovery scope (`mcp:tools:extended`), so a default token sees the minimal set.
 
 ---
 
-## Tool Contract
+## Security properties
 
-Stair 23 exposes one deliberately small tool:
-
-`read_document`
-
-The input contract is defined using Pydantic:
-
-class DocumentRequest(BaseModel):
-    tenant_id: str
-    document_id: str
-
-The output contract is also defined using Pydantic:
-
-class DocumentResult(BaseModel):
-    tenant_id: str
-    document_id: str
-    value: str
-
-The resulting MCP input shape is:
-
-{
-  "request": {
-    "tenant_id": "tenant-a",
-    "document_id": "doc-001"
-  }
-}
-
-The structured result is:
-
-{
-  "tenant_id": "tenant-a",
-  "document_id": "doc-001",
-  "value": "Example document for Tenant A."
-}
-
-### Tenant scoping
-
-The tool uses the pair:
-
-`tenant_id + document_id`
-
-as the lookup key.
-
-For Stair 23, the backing store is intentionally a small in-memory mock:
-
-("tenant-a", "doc-001")
-("tenant-b", "doc-001")
-
-This demonstrates the tenant-scoped contract without pretending that production database authorization has already been implemented.
+- **OAuth 2.1 authorization server** with `private_key_jwt` client assertions (RFC 7523, Ed25519). No shared
+  client secrets, no Dynamic Client Registration.
+- **Audience-bound, short-lived tokens** (≤15 min) with per-namespace scopes.
+- **Rate limiting on the token endpoint**: a per-client bucket returns `429` with `Retry-After` instead of
+  letting one client exhaust the issuer.
+- **Replay protection that can be shared**: assertion `jti`s are stored in-process by default, or in Redis
+  (`REDIS_URL`) so the limit still holds with several authorization-server replicas.
+- **Local validation** in the resource server: JWKS is cached, revocation is served from cache — a request
+  never blocks on the authorization server.
+- **Clock-skew tolerance is explicit**: 5 seconds, applied at validation, asserted in tests.
+- **Containment**: file paths are canonicalised (`realpath`) before being checked against configured roots, so
+  traversal and symlink escapes are rejected. Outbound calls are deny-by-default against an allowlist and
+  private/loopback/link-local/metadata ranges are blocked.
+- **Human-in-the-loop for destructive tools**: an HMAC-signed, timestamped, single-use webhook must approve the
+  exact request before it executes. Replays are rejected (`409`).
+- **Append-only audit sink**; a failed audit write is reported rather than swallowed.
 
 ---
 
-## Project Structure
+## Quickstart
 
-stateless-mcp-governance-router/
-├── .env.example
-├── pyproject.toml
-├── README.md
-└── src/
-    └── mcp_router/
-        ├── __init__.py
-        └── server.py
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 
-### Important files
+cp .env.example .env
+python scripts/bootstrap_dev.py          # generates the AS key + a registered dev client
 
-| File | Purpose |
-|---|---|
-| `pyproject.toml` | Project metadata, Python requirement, runtime dependency, and package/build configuration |
-| `.env.example` | Safe template for local environment configuration |
-| `src/mcp_router/server.py` | FastMCP server, typed models, tool, and HTTP server startup |
-| `README.md` | Architecture, design decisions, verification evidence, and project roadmap |
+# terminal 1 — authorization server
+python -m mcp_router.authorization_server
 
----
-
-## Technology Stack
-
-- Python 3.13
-- FastMCP 4.x
-- Pydantic
-- HTTP transport
-- Uvicorn through FastMCP's HTTP serving path
-- MCP Inspector
-- `pyproject.toml` + setuptools
-- VS Code development workflow
-
----
-
-## Local Setup
-
-### 1. Create the virtual environment
-
-This project requires Python 3.11 or newer.
-
-Example:
-
-/opt/homebrew/opt/python@3.13/bin/python3.13 -m venv .venv
-
-Activate it:
-
-source .venv/bin/activate
-
-Verify:
-
-python --version
-
-Expected:
-
-Python 3.13.x
-
----
-
-### 2. Install the project
-
-Install the project in editable mode:
-
-python -m pip install -e .
-
-Editable installation allows the local source code to be used directly while developing the project.
-
----
-
-### 3. Start the server
-
+# terminal 2 — the governed MCP router
 python -m mcp_router.server
+```
 
-The default local endpoint is:
+Fetching a token requires a signed client assertion, so the client code is easier to read than to curl:
+`signed_assertion()` and `token_request()` in `tests/test_authorization_server.py` show the full exchange,
+and `scripts/e2e_harness.py` runs the whole governed flow end to end.
 
-http://127.0.0.1:8000/mcp
+Calling a tool (once you hold a token):
 
-The host and port can be configured through:
-
-MCP_HOST
-MCP_PORT
-
----
-
-## MCP Verification
-
-The implementation was verified through the actual MCP HTTP endpoint.
-
-### Server startup
-
-Verified:
-
-FastMCP 4.0.3
-Starting MCP server 'Stateless MCP Governance Router'
-with transport 'http' (stateless)
-on http://127.0.0.1:8000/mcp
+```bash
+curl -s http://127.0.0.1:8000/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"documents.read_document",
+                 "arguments":{"request":{"tenant_id":"tenant-a","document_id":"doc-001"}}}}'
+```
 
 ---
 
-### MCP initialization
+## Verification
 
-`initialize` returned:
+```bash
+pytest -q                     # 71 tests: auth server, enforcement, ingress, registry, containment, approvals, hardening
+python scripts/e2e_harness.py  # 12 governance checks against a real app instance
+python scripts/benchmark_tokens.py
+python scripts/load_test.py    # against a running instance (default :8010)
+```
 
-HTTP/1.1 200 OK
+Current results on this machine:
 
-The server reported:
-
-protocolVersion: 2025-06-18
-serverInfo.name: Stateless MCP Governance Router
-
----
-
-### Tool discovery
-
-`tools/list` returned:
-
-HTTP/1.1 200 OK
-
-The server exposed exactly one tool:
-
-`read_document`
-
-The MCP response included both an input schema and an output schema.
+- `pytest`: **71 passed**
+- `scripts/e2e_harness.py`: **12/12 checks passed** — token required, cross-scope 403, host mismatch 400,
+  GET 405, authorized read 200, path escape denied, approval required → signed approval → executes once →
+  replay rejected → single-use confirmed.
+- `scripts/benchmark_tokens.py`: discovery payload drops from **880 bytes** (full exposure) to **172 bytes**
+  (scope-filtered progressive disclosure), a **80.5% reduction**; p50 of local serialisation is 0.004 ms vs
+  0.001 ms over 100 iterations.
 
 ---
 
-### Tool execution
+## Implemented / verified / gaps
 
-The following tenant-scoped request was executed:
+| Area | Implemented | Verified |
+|------|-------------|----------|
+| Authorization server (metadata, JWKS, `/token`, `/revoke`, `/revoked`) | yes | yes — 10 tests |
+| private_key_jwt validation (signature, iss/sub, aud, exp, jti replay) | yes | yes — happy path + 5 negatives |
+| Token enforcement (401 paths, skew, cached revocation) | yes | yes — 12 tests, incl. "no per-request fetch" |
+| Ingress guard (Host/Origin, 405) | yes | yes — 8 tests |
+| Registry (strict contracts, namespaces, scopes, tiers) | yes | yes — 14 tests |
+| Scope guard (403, cross-namespace) | yes | yes — harness + tests |
+| Progressive disclosure | yes | yes — listing assertions + benchmark |
+| Path containment + egress policy | yes | yes — 8 tests |
+| Audit sink | yes | yes — event assertions + write-failure test |
+| Approval webhook (HMAC, single-use) | yes | yes — 6 tests + harness |
+| Token-endpoint rate limiting (429 + Retry-After) | yes | yes — endpoint test |
+| Shared replay store (Redis `SET NX EX`) | yes | yes — verified against a live Redis container |
+| Docker image | yes | yes — built and exercised (401 / 405 / 400 from the container) |
+| Deployment (AWS ECS Fargate) | **no** | — |
 
-{
-  "request": {
-    "tenant_id": "tenant-a",
-    "document_id": "doc-001"
-  }
-}
-
-The MCP response returned:
-
-{
-  "tenant_id": "tenant-a",
-  "document_id": "doc-001",
-  "value": "Example document for Tenant A."
-}
-
-The response contained:
-
-`isError: false`
-
----
-
-### GET → 405
-
-Direct request:
-
-curl -i http://127.0.0.1:8000/mcp
-
-Verified:
-
-HTTP/1.1 405 Method Not Allowed
-
-Response body:
-
-Method Not Allowed
+**Not deployed.** This project is verified locally and is not running in any hosted environment. A
+`Dockerfile` and a GitHub Actions workflow are included; the workflow has not been run on GitHub yet.
 
 ---
 
-## MCP Inspector Verification
+## Layout
 
-The project was connected to MCP Inspector using:
-
-Transport: streamable-http
-URL: http://127.0.0.1:8000/mcp
-
-The Inspector successfully connected to the local MCP server.
-
-The Inspector CLI was then used to execute the actual tool:
-
-npx @modelcontextprotocol/inspector --cli \
-  http://127.0.0.1:8000/mcp \
-  --transport http \
-  --method tools/call \
-  --tool-name read_document \
-  --tool-args-json '{"request":{"tenant_id":"tenant-a","document_id":"doc-001"}}' \
-  --format json
-
-Verified result:
-
-{
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "{\"tenant_id\":\"tenant-a\",\"document_id\":\"doc-001\",\"value\":\"Example document for Tenant A.\"}"
-      }
-    ],
-    "structuredContent": {
-      "tenant_id": "tenant-a",
-      "document_id": "doc-001",
-      "value": "Example document for Tenant A."
-    },
-    "isError": false
-  }
-}
-
-This confirms that the tool can be executed through the MCP protocol using an MCP client/tooling layer rather than only by directly calling Python code.
+```
+src/mcp_router/
+  authorization_server.py   OAuth 2.1 AS: metadata, JWKS, /token, /revoke
+  tokens.py                 claim model, mint/verify, private_key_jwt assertion checks
+  keys.py clients.py        Ed25519 key handling, registered clients
+  jwks_cache.py             cached key set with rotation refresh
+  revocation_cache.py       cached revocation list
+  ingress_guard.py          Host/Origin allowlist, 405
+  enforcement.py            bearer token validation middleware
+  scope_guard.py            per-tool scope enforcement (403)
+  disclosure.py             scope-driven tools/list
+  registry.py               tool declarations + strict contract validation
+  containment.py            realpath root confinement, egress policy
+  audit.py                  append-only JSONL audit sink
+  approvals.py              pending-approval store + HMAC webhook verification
+  server.py                 wiring: registry, middleware chain, routes
+docs/owasp-mcp-mapping.md   OWASP MCP Top-10 control mapping + known gaps
+scripts/                    bootstrap, e2e harness, token benchmark
+tests/                      pytest suite
+```
 
 ---
 
-## Verification Checklist
+## Operational verification
 
-- [x] Project scaffold created
-- [x] Python 3.13 virtual environment created
-- [x] `pyproject.toml` validated
-- [x] Editable project installation succeeded
-- [x] FastMCP installed successfully
-- [x] Stateless HTTP server starts successfully
-- [x] MCP `/mcp` endpoint verified
-- [x] `initialize` request verified
-- [x] `tools/list` verified
-- [x] Exactly one curated tool exposed
-- [x] Pydantic input contract verified
-- [x] Pydantic output contract verified
-- [x] `tools/call` verified through raw MCP HTTP
-- [x] Tenant-scoped document lookup verified
-- [x] `GET /mcp` → HTTP 405 verified
-- [x] MCP Inspector connection verified
-- [x] MCP Inspector CLI tool execution verified
-- [ ] OAuth 2.1
-- [ ] Authorization / scoped delegation
-- [ ] Additional enterprise tools
-- [ ] MCP05 schema hardening
-- [ ] Immutable audit logging
-- [ ] Host/origin protection
-- [ ] Tool sandbox / egress controls
-- [ ] Progressive Disclosure
-- [ ] OWASP MCP Top 10 hardening
-- [ ] AWS ECS Fargate deployment
+Run on this machine, against a real container and a real Redis:
 
----
-
-## Security Scope
-
-Security hardening is intentionally **not implemented in Stair 23**.
-
-The current implementation demonstrates the protocol and architectural foundation only.
-
-There is currently:
-
-- no OAuth authentication
-- no authorization layer
-- no production identity provider
-- no persistent database
-- no production tenant authorization policy
-- no immutable audit sink
-- no SSRF protection
-- no tool sandbox
-- no progressive-disclosure mechanism
-- no OWASP MCP Top 10 hardening layer
-
-These capabilities are introduced in later build stages.
+- **Image builds and serves:** `docker build -t mcp-governance-router:local .` → rebuilt cleanly; the container
+  answers `401` without a token, `405` + `Allow: POST` on GET, and `400 HeaderMismatch` on a foreign Host.
+- **Redis replay store:** verified against a live Redis 7 container — a second store instance rejects the same
+  `jti`, which is the multi-replica claim (`tests/test_redis_live.py`, 3 tests, skipped when no Redis is present).
+- **Load:** 300 requests at concurrency 25 through the governance chain (unauthenticated path) →
+  **612 req/s, p50 29 ms, p95 97 ms, p99 141 ms, 0 errors**, every request correctly `401`.
+- **Dependency audit:** `pip-audit` → **no known vulnerabilities** in both the development environment and the
+  runtime image.
 
 ---
 
 ## Roadmap
 
-### Stair 24 — OAuth 2.1 / AuthPlane
-
-Planned:
-
-- OAuth 2.1
-- RFC 7523 Ed25519 authentication
-- short-lived tokens
-- tool-scoped authorization
-- no Dynamic Client Registration
-- HostOriginGuard
-
-### Stair 25 — Curated Tools
-
-Planned:
-
-- enterprise-oriented tools
-- typed tool registry
-- controlled tool exposure
-- namespace governance
-
-### Stair 26 — MCP05 Schema Hardening
-
-Planned:
-
-- stricter Pydantic contracts
-- schema pinning
-- validation against unsafe tool definitions
-
-### Stairs 27–29 — Governance, Testing and Hardening
-
-Planned:
-
-- immutable OTel audit sink
-- 405 ASGI protection
-- HostOriginGuard
-- deny-by-default sandbox / egress controls
-- MCP Inspector test harness
-- Progressive Disclosure
-- quantified token-economy benchmark
-- OWASP MCP Top 10 hardening
-- final technical README and freeze
-
----
-
-## Production Deployment
-
-### Target
-
-AWS ECS Fargate
-
-The project is intentionally designed as a standalone service and will be deployed independently from the other portfolio projects.
-
-Deployment work is **not part of Stair 23**.
-
-AWS Load Balancer
-       ↓
-ECS Fargate
-       ↓
-FastMCP Stateless Router
-       ↓
-Governed Tools
-
-Production infrastructure, authentication, authorization, observability, and security controls will be added in later Stairs.
-
----
-
-## Portfolio Positioning
-
-**Portfolio theme:**
-
-> Production-Grade Agentic Infrastructure
-
-This project represents the **MCP perimeter / tool-access layer** of the portfolio.
-
-The goal is to demonstrate that an agentic system can be given standardized tool access while progressively adding:
-
-Stateless MCP
-      ↓
-Authentication
-      ↓
-Authorization
-      ↓
-Schema Governance
-      ↓
-Auditability
-      ↓
-Sandboxing
-      ↓
-Progressive Disclosure
-      ↓
-Production Deployment
-
----
-
-## Loom Demo
-
-### Planned 2-minute walkthrough
-
-**0:00–0:25 — Problem**
-
-Explain why agents need standardized and controlled access to external tools.
-
-**0:25–0:50 — Architecture**
-
-Show:
-
-Agent → Stateless MCP Router → Tool
-
-Explain why stateless HTTP is useful for horizontally scalable services.
-
-**0:50–1:20 — Live MCP execution**
-
-Show MCP Inspector connecting to:
-
-http://127.0.0.1:8000/mcp
-
-Execute:
-
-`read_document`
-
-and show the structured response.
-
-**1:20–1:40 — HTTP protection**
-
-Show:
-
-GET /mcp
-→ 405 Method Not Allowed
-
-**1:40–2:00 — Roadmap**
-
-Explain how later Stairs add OAuth, authorization, schema governance, audit logging, sandboxing, and Progressive Disclosure.
-
-### Loom
-
-> TODO — record after Stair 23 freeze.
-
----
-
-## Current Status
-
-**Stair 23 — Build**
-
-Status:
-
-> **Implementation and local verification complete; Git commit/push and final Stair 23 freeze pending.**
-
-Current build demonstrates:
-
-- Stateless FastMCP HTTP serving
-- One typed tenant-scoped tool
-- Pydantic request/response contracts
-- MCP protocol discovery
-- MCP tool execution
-- HTTP 405 behavior
-- MCP Inspector verification
-
-The project does **not** yet claim production security or deployment.
-
----
-
-## License
-
-Private portfolio project during development.
-
-The repository will be made public after deployment and portfolio preparation.
+- Redis-backed replay store and rate limiting on the token endpoint.
+- Deployment (planned: AWS ECS Fargate) — not started.
+- Promote the in-memory document store to PostgreSQL with row-level security.

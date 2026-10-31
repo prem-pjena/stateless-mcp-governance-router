@@ -1,8 +1,10 @@
-.DS_Store
-__pycache__/
-*.py[cod]
 .venv/
-venv/
+__pycache__/
+*.pyc
 .env
-node_modules/
-dist/
+keys/
+data/
+logs/
+harness-data/
+.pytest_cache/
+*.egg-info/
